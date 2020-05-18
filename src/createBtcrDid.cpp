@@ -2,8 +2,6 @@
 #include <cstdlib>
 #include <memory>
 #include "bitcoinRPCFacade.h"
-#include "chainQuery.h"
-#include "chainSoQuery.h"
 #include "encodeOpReturnData.h"
 #include "satoshis.h"
 #include "classifyInputString.h"
@@ -19,7 +17,7 @@ namespace pt = boost::property_tree;
 struct CmdlineInput {
     std::string query ="";
     int txoIndex = 0;
-    bool forceExtended = false;
+    bool dryrun = false;
 };
 
 struct TransactionData {
@@ -29,6 +27,15 @@ struct TransactionData {
     std::string ddoRef;
     double fee = 0.0;
     int txoIndex = 0;
+};
+
+struct UnspentData {
+    std::string address;
+    std::string txid;
+    std::string scriptPubKeyHex;
+    std::string redeemScript;
+    int64_t amountSatoshis = 0;
+    int utxoIndex = 0;
 };
 
 
@@ -58,6 +65,7 @@ int parseCommandLineArgs(int argc, char **argv,
     opt->addUsage( " --rpcport [port]           RPC port (default: try both 8332 and 18332) " );
     opt->addUsage( " --config [config_path]     Full pathname to bitcoin.conf (default: <homedir>/.bitcoin/bitcoin.conf) " );
     opt->addUsage( " --txoIndex [index]         Index # of which TXO to use from the input transaction (default: 0) " );
+    opt->addUsage( " -n --dryrun                Do everything except submit transaction to blockchain" );
     opt->addUsage( "" );
     opt->addUsage( "<inputXXX>      input: (bitcoin address, txid, txref) needs at least slightly more unspent BTCs than your offered fee" );
     opt->addUsage( "<outputAddress> output bitcoin address: will receive transaction change and be the basis for your DID" );
@@ -66,6 +74,7 @@ int parseCommandLineArgs(int argc, char **argv,
     opt->addUsage( "<ddoRef>        reference to a DDO you want as part of your DID (optional)" );
 
     opt->setFlag("help", 'h');
+    opt->setFlag("dryrun", 'n');
     opt->setOption("rpchost");
     opt->setOption("rpcuser");
     opt->setOption("rpcpassword");
@@ -109,6 +118,11 @@ int parseCommandLineArgs(int argc, char **argv,
         opt->printUsage();
         delete opt;
         return 0;
+    }
+
+    // was dryrun requested?
+    if (opt->getFlag("dryrun") || opt->getFlag('n')) {
+        cmdlineInput.dryrun = true;
     }
 
     // see if there is an rpchost specified. If not, use default
@@ -170,6 +184,7 @@ void printAsJson(const std::string & txid) {
     if(!txid.empty()) {
         root.put("comment", "transaction submitted");
         root.put("txid", txid);
+        root.put("txoIndex", 1); // TODO: always 1 for now
     }
     else
         root.put("error", "the network did not accept our transaction");
@@ -218,12 +233,26 @@ int main(int argc, char *argv[]) {
             t2t::ConfigTemp configTemp;
             configTemp.query = cmdlineInput.query;
             configTemp.txoIndex = cmdlineInput.txoIndex;
-            configTemp.forceExtended = cmdlineInput.forceExtended;
 
             t2t::decodeTxref(btc, configTemp, transaction);
 
             // use txid from decoded txref and cmd-line txoIndex to get utxoInfo
             utxoinfo_t utxoinfo = btc.gettxout(transaction.txid, transactionData.txoIndex);
+
+            if(utxoinfo.value == 0) {
+                std::cerr << "Error: address at txid: " << transaction.txid
+                          << " and txoIndex: " << transactionData.txoIndex
+                          << " has no value." << std::endl;
+                std::exit(-1);
+            }
+
+            assert(utxoinfo.scriptPubKey.addresses.size() == 1);
+            unspentData.address = utxoinfo.scriptPubKey.addresses[0];
+            btcaddressinfo_t btcaddressinfo = btc.getaddressinfo(unspentData.address);
+            if(btcaddressinfo.isscript) {
+                if(btcaddressinfo.script == "witness_v0_keyhash")
+                    unspentData.redeemScript = btcaddressinfo.hex;
+            }
 
             unspentData.txid = transaction.txid;
             unspentData.utxoIndex = transactionData.txoIndex;
@@ -237,13 +266,26 @@ int main(int argc, char *argv[]) {
             t2t::ConfigTemp configTemp;
             configTemp.query = cmdlineInput.query;
             configTemp.txoIndex = cmdlineInput.txoIndex;
-            configTemp.forceExtended = cmdlineInput.forceExtended;
 
             t2t::decodeTxref(btc, configTemp, transaction);
 
             // use txid and txoIndex from decoded txrefext to get utxoInfo
             utxoinfo_t utxoinfo = btc.gettxout(transaction.txid, transaction.txoIndex);
 
+            if(utxoinfo.value == 0) {
+                std::cerr << "Error: address at txid: " << transaction.txid
+                          << " and txoIndex: " << transactionData.txoIndex
+                          << " has no value." << std::endl;
+                std::exit(-1);
+            }
+
+            assert(utxoinfo.scriptPubKey.addresses.size() == 1);
+            unspentData.address = utxoinfo.scriptPubKey.addresses[0];
+            btcaddressinfo_t btcaddressinfo = btc.getaddressinfo(unspentData.address);
+            if(btcaddressinfo.isscript) {
+                if(btcaddressinfo.script == "witness_v0_keyhash")
+                    unspentData.redeemScript = btcaddressinfo.hex;
+            }
             unspentData.txid = transaction.txid;
             unspentData.utxoIndex = transaction.txoIndex;
             unspentData.amountSatoshis = btc2satoshi(utxoinfo.value);
@@ -253,6 +295,20 @@ int main(int argc, char *argv[]) {
             // use cmd-line txid and cmd-line txoIndex to get utxoInfo
             utxoinfo_t utxoinfo = btc.gettxout(transactionData.inputString, transactionData.txoIndex);
 
+            if(utxoinfo.value == 0) {
+                std::cerr << "Error: address at txid: " << transactionData.inputString
+                          << " and txoIndex: " << transactionData.txoIndex
+                          << " has no value." << std::endl;
+                std::exit(-1);
+            }
+
+            assert(utxoinfo.scriptPubKey.addresses.size() == 1);
+            unspentData.address = utxoinfo.scriptPubKey.addresses[0];
+            btcaddressinfo_t btcaddressinfo = btc.getaddressinfo(unspentData.address);
+            if(btcaddressinfo.isscript) {
+                if(btcaddressinfo.script == "witness_v0_keyhash")
+                    unspentData.redeemScript = btcaddressinfo.hex;
+            }
             unspentData.txid = transactionData.inputString;
             unspentData.utxoIndex = transactionData.txoIndex;
             unspentData.amountSatoshis = btc2satoshi(utxoinfo.value);
@@ -288,7 +344,7 @@ int main(int argc, char *argv[]) {
         signrawtxin.txid = unspentData.txid;
         signrawtxin.n = static_cast<unsigned int>(unspentData.utxoIndex);
         signrawtxin.scriptPubKey = unspentData.scriptPubKeyHex;
-        signrawtxin.redeemScript = "";
+        signrawtxin.redeemScript = unspentData.redeemScript;
         signrawtxin.amount = std::to_string(satoshi2btc(unspentData.amountSatoshis));
 
         std::string signedRawTransaction =
@@ -299,10 +355,16 @@ int main(int argc, char *argv[]) {
             std::exit(-1);
         }
 
-        // broadcast to network
-        std::string resultTxid = btc.sendrawtransaction(signedRawTransaction);
-
-        printAsJson(resultTxid);
+        if(cmdlineInput.dryrun) {
+            std::cout << "Constructing and signing the transaction was successful, but not submitted to the Bitcoin network." << std::endl;
+        }
+        else {
+            std::cout << "Constructing and signing the transaction was successful. Now submitting to the Bitcoin network." << std::endl;
+            std::cout << "After a few minutes you can use txid2txref with the following data to compute your txref and DID." << std::endl;
+            // broadcast to network
+            std::string resultTxid = btc.sendrawtransaction(signedRawTransaction);
+            printAsJson(resultTxid);
+        }
 
         // TODO create a DID object and print out the DID string. Warn that it isn't valid until
         // the transaction has enough confirmations
